@@ -165,16 +165,18 @@ function connectWebSocket() {
         if (isNew) {
           logMonitor(`✨ [TRIAGEM 1] Nova moeda unpaid detectada via WebSocket: ${ticker} (Address: ${address})`);
 
-          // Calcula holdings em background e atualiza
-          getDevHold(devWallet, address).then(async (holdPct) => {
-            try {
-              const pool = db.getPool();
-              await pool.query("UPDATE coins SET initial_dev_hold = ? WHERE address = ?", [holdPct, address]);
-              logMonitor(`💻 Holdings do Dev calculadas para ${ticker}: ${holdPct}`);
-            } catch (err) {
-              logMonitor(`Erro ao atualizar holdings do Dev para ${ticker}: ${err.message}`, "WARN");
-            }
-          });
+          // Calcula holdings em background com delay de 3 segundos para indexação da rede Solana
+          setTimeout(() => {
+            getDevHold(devWallet, address).then(async (holdPct) => {
+              try {
+                const pool = db.getPool();
+                await pool.query("UPDATE coins SET initial_dev_hold = ? WHERE address = ?", [holdPct, address]);
+                logMonitor(`💻 Holdings do Dev calculadas para ${ticker}: ${holdPct}`);
+              } catch (err) {
+                logMonitor(`Erro ao atualizar holdings do Dev para ${ticker}: ${err.message}`, "WARN");
+              }
+            });
+          }, 3000);
         }
       }
     } catch (err) {
