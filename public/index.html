@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Axiom DEX Paid Monitor &amp; Real-Time Analytics</title>
+  
+  <!-- Google Fonts: Outfit (Interface) & JetBrains Mono (Dados e Endereços) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&amp;family=Outfit:wght@300;400;500;600;700;800&amp;display=swap" rel="stylesheet">
+  
+  <!-- Biblioteca de Gráficos Ultra-Leve Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  
+  <!-- CSS Personalizado -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="dark-mode">
+
+  <div class="glass-bg"></div>
+
+  <header class="main-header">
+    <div class="logo-area">
+      <div class="pulse-indicator glow-green" id="serverStatus"></div>
+      <h1 class="logo-title">AXIOM <span>PULSE MONITOR</span></h1>
+    </div>
+    
+    <div class="system-stats">
+      <div class="stat-badge">
+        <span class="stat-label">Triagem 2 (Ativas)</span>
+        <span class="stat-value text-accent-green" id="activeCount">0</span>
+      </div>
+      <div class="stat-badge">
+        <span class="stat-label">Triagem 3 (Arquivadas)</span>
+        <span class="stat-value text-accent-purple" id="historyCount">0</span>
+      </div>
+    </div>
+
+    <div class="download-actions">
+      <button class="btn btn-primary" onclick="downloadCSV()">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/><path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/></svg>
+        Baixar CSV
+      </button>
+      <button class="btn btn-secondary" onclick="downloadJSON()">
+        Baixar JSON
+      </button>
+    </div>
+  </header>
+
+  <main class="dashboard-container">
+    
+    <!-- Painel de Controle e Filtros -->
+    <section class="control-panel">
+      <div class="panel-section">
+        <h3>🔍 Filtro de Moedas</h3>
+        <div class="filters-row">
+          <div class="input-group">
+            <label for="searchTicker">Ticker / Nome</label>
+            <input type="text" id="searchTicker" placeholder="Ex: AXION, SOL" oninput="applyFilters()">
+          </div>
+          
+          <div class="input-group range-group">
+            <label for="minMCap">Market Cap Mínimo: <span id="mcapDisplay">$10K</span></label>
+            <input type="range" id="minMCap" min="0" max="100" value="10" oninput="updateMCapLabel(this.value); applyFilters();">
+          </div>
+
+          <div class="input-group toggle-group">
+            <label for="soundToggle">Alerta Sonoro Premium</label>
+            <label class="switch">
+              <input type="checkbox" id="soundToggle" checked>
+              <span class="slider round"></span>
+            </label>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Navegação por Abas -->
+    <nav class="tab-navigation">
+      <button class="tab-btn active" onclick="switchTab('triagem2')">
+        🔥 Triagem 2 <span class="tab-subtitle">Análise Ativa (15 Minutos)</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('triagem3')">
+        📦 Triagem 3 <span class="tab-subtitle">Banco Histórico Estático (MySQL)</span>
+      </button>
+    </nav>
+
+    <!-- Conteúdo das Abas -->
+    <section class="tab-content" id="triagem2Tab">
+      <div class="section-header">
+        <h2>🔥 Moedas Recém Pagas (Janela Ativa de 15 Minutos)</h2>
+        <p>Acompanhamento minuto a minuto do dip e pump de moedas que acabaram de pagar a DEX.</p>
+      </div>
+      
+      <div class="stage2-grid" id="stage2Grid">
+        <!-- Cards da Triagem 2 serão renderizados aqui dinamicamente -->
+        <div class="no-data-card" id="noActiveData">
+          <div class="spinner-neon"></div>
+          <p>Aguardando novas moedas pagarem a DEX no Axiom Trade...</p>
+          <span class="subtext">Varrando a cada 5 segundos. Moedas com mais de 15 minutos são arquivadas.</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab-content hidden" id="triagem3Tab">
+      <div class="section-header">
+        <h2>📦 Banco de Dados Estático (Histórico Acumulado)</h2>
+        <p>Dados consolidados da Triagem 3 salvos no MySQL após a execução da análise de 15 minutos.</p>
+      </div>
+
+      <div class="table-container">
+        <table class="premium-table">
+          <thead>
+            <tr>
+              <th>Ticker</th>
+              <th>Nome</th>
+              <th>Market Cap Inicial</th>
+              <th>Bonding Curve</th>
+              <th>Dev Hold %</th>
+              <th>Horário Pagamento</th>
+              <th>Contrato</th>
+            </tr>
+          </thead>
+          <tbody id="stage3TableBody">
+            <tr>
+              <td colspan="7" class="table-no-data">Nenhum dado arquivado no banco ainda. Deixe rodando para capturar!</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="main-footer">
+    <p>Axiom DEX Paid Monitor v1.0 • Desenvolvido de forma sustentável para o Railway</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
