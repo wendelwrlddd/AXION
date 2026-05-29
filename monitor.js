@@ -80,17 +80,55 @@ async function getDevHold(traderPublicKey, mintAddress) {
 async function checkDexPaid(mintAddress) {
   if (!mintAddress) return false;
   const cleanMint = mintAddress.replace("solana:", "");
-  const url = `https://api.dexscreener.com/orders/v1/solana/${cleanMint}`;
+  
+  // 1. PRIMEIRA CHECAGEM: API de Pedidos (Orders API)
+  let paidViaOrders = false;
+  const ordersUrl = `https://api.dexscreener.com/orders/v1/solana/${cleanMint}`;
   try {
-    const res = await fetch(url);
-    if (!res.ok) return false;
-    const json = await res.json();
-    if (json.orders && Array.isArray(json.orders)) {
-      return json.orders.some(o => o.type === "tokenProfile" && o.status === "approved");
+    const res = await fetch(ordersUrl);
+    if (res.ok) {
+      const json = await res.json();
+      if (json.orders && Array.isArray(json.orders)) {
+        paidViaOrders = json.orders.some(o => o.type === "tokenProfile" && o.status === "approved");
+      }
     }
   } catch (err) {
-    logMonitor(`Erro ao checar DEX Paid no DexScreener para ${cleanMint}: ${err.message}`, "WARN");
+    logMonitor(`Erro ao checar DEX Paid via Orders para ${cleanMint}: ${err.message}`, "WARN");
   }
+
+  if (paidViaOrders) {
+    logMonitor(`🚨 DEX Paid detectado via Orders API para ${cleanMint}`, "INFO");
+    return true;
+  }
+
+  // 2. SEGUNDA CHECAGEM: API de Tokens (Token Pairs API) - Checando ícones/links/banners
+  const tokenUrl = `https://api.dexscreener.com/latest/dex/tokens/${cleanMint}`;
+  try {
+    const res = await fetch(tokenUrl);
+    if (res.ok) {
+      const json = await res.json();
+      if (json.pairs && Array.isArray(json.pairs)) {
+        for (const pair of json.pairs) {
+          // Se o desenvolvedor pagou, o DexScreener anexa um objeto "info" com os metadados ricos
+          if (pair.info) {
+            const hasIcon = !!pair.info.imageUrl || !!pair.info.icon;
+            const hasWebsites = pair.info.websites && pair.info.websites.length > 0;
+            const hasSocials = pair.info.socials && pair.info.socials.length > 0;
+            const hasHeader = !!pair.info.header;
+
+            // Se tiver qualquer informação de perfil rica adicionada, é DEX Paid!
+            if (hasIcon || hasWebsites || hasSocials || hasHeader) {
+              logMonitor(`🚨 DEX Paid detectado via Token Info (Ícone/Banner/Links ativos) para ${cleanMint}`, "INFO");
+              return true;
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    logMonitor(`Erro ao checar DEX Paid via Token Info para ${cleanMint}: ${err.message}`, "WARN");
+  }
+
   return false;
 }
 

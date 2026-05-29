@@ -243,7 +243,7 @@ async function getActiveCoins() {
   try {
     const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
     const [rows] = await p.query(
-      `SELECT * const from coins WHERE status = 'paid' AND paid_at >= ? ORDER BY paid_at DESC`,
+      `SELECT * FROM coins WHERE status = 'paid' AND paid_at >= ? ORDER BY paid_at DESC`,
       [fifteenMinutesAgo]
     );
     return rows;
