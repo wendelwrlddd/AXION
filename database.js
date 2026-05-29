@@ -1,16 +1,17 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 
+// Mapeamento e controle em memória para testes no Localhost caso MySQL falhe
+let isMock = false;
+const mockCoins = [];
+const mockHistory = [];
+
 // Resolve connection credentials (supports public URL for local dev, and internal variables for Railway production)
 function getConnectionConfig() {
-  // Se houver a URL pública explícita (que definimos no .env local), usamos ela obrigatoriamente local
   const publicUrl = process.env.DATABASE_URL || process.env.MYSQL_PUBLIC_URL;
-  
-  // Verifica se estamos na nuvem da Railway ou rodando localmente
   const isCloud = process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_STATIC_URL || (process.env.PORT && !publicUrl);
   
   if (isCloud) {
-    console.log("🔌 Database: Detectado ambiente Railway Cloud! Conectando via rede interna de alta velocidade...");
     const internalUrl = process.env.MYSQL_URL || process.env.DATABASE_URL;
     if (internalUrl && !internalUrl.includes('proxy.rlwy.net') && internalUrl.includes('internal')) {
       return internalUrl;
@@ -24,12 +25,9 @@ function getConnectionConfig() {
     };
   }
 
-  console.log("🔌 Database: Detectado ambiente local! Forçando uso do Proxy Público da Railway...");
   if (publicUrl) {
     return publicUrl;
   }
-  
-  // Fallback seguro caso .env não carregue
   return "mysql://root:HWOJHYShbuIpuaKszfHPVgyGgnnxIZVB@zephyr.proxy.rlwy.net:16223/railway";
 }
 
@@ -53,9 +51,13 @@ async function initDB() {
       pool = mysql.createPool({ ...config, ...options });
     }
 
-    console.log("🛠️ Database: Verificando e criando tabelas...");
+    // Tenta uma consulta simples para validar a conexão ativa com o MySQL
+    const conn = await pool.getConnection();
+    conn.release();
 
-    // 1. Tabela de Moedas (Geral, Triagem 1 e 3)
+    console.log("🔌 Database: MySQL conectado com sucesso! Verificando e criando tabelas...");
+
+    // 1. Tabela de Moedas
     await pool.query(`
       CREATE TABLE IF NOT EXISTS coins (
         address VARCHAR(150) PRIMARY KEY,
@@ -64,7 +66,7 @@ async function initDB() {
         initial_market_cap VARCHAR(50),
         initial_progress VARCHAR(20),
         initial_dev_hold VARCHAR(20),
-        status VARCHAR(30) DEFAULT 'unpaid', -- 'unpaid', 'pre_paid' (já estava paga no boot), 'paid' (paga em monitoramento)
+        status VARCHAR(30) DEFAULT 'unpaid',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         paid_at TIMESTAMP NULL DEFAULT NULL,
         INDEX idx_status (status),
@@ -72,7 +74,7 @@ async function initDB() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
 
-    // 2. Tabela de Histórico de Alta Frequência (Triagem 2)
+    // 2. Tabela de Histórico
     await pool.query(`
       CREATE TABLE IF NOT EXISTS price_history (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -87,11 +89,34 @@ async function initDB() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
 
-    console.log("✅ Database: Tabelas prontas e banco de dados conectado com sucesso!");
+    console.log("✅ Database: Tabelas prontas e banco MySQL ativado!");
+    isMock = false;
     return pool;
   } catch (err) {
-    console.error("❌ Database: Falha catastrófica ao conectar ou criar tabelas no MySQL:", err.message);
-    throw err;
+    console.warn("⚠️ Database: Não foi possível conectar ao banco de dados MySQL:", err.message);
+    console.warn("⚡ MODO LOCALHOST ATIVADO: Usando Banco de Dados In-Memory (Sem necessidade de MySQL local)!");
+    isMock = true;
+    // Cria um pool fake mínimo para evitar falhas em outros comandos de query
+    pool = {
+      query: async (queryStr, params) => {
+        // Tratamento simples para a query de delete do faxineiro
+        if (queryStr.includes("DELETE FROM coins")) {
+          const twoHoursAgo = params[0];
+          let removedCount = 0;
+          for (let i = mockCoins.length - 1; i >= 0; i--) {
+            const coin = mockCoins[i];
+            if (coin.status === 'unpaid' && coin.created_at < twoHoursAgo) {
+              mockCoins.splice(i, 1);
+              removedCount++;
+            }
+          }
+          return [{ affectedRows: removedCount }, null];
+        }
+        // Para consultas customizadas, retorna array vazio compatível com desestruturação
+        return [[], []];
+      }
+    };
+    return pool;
   }
 }
 
@@ -105,12 +130,29 @@ function getPool() {
 
 /**
  * Insere uma nova moeda se ela ainda não existir no banco.
- * Se já existir, NÃO faz nada para manter o status e timestamps originais.
  */
 async function upsertCoin(address, ticker, name, initialMarketCap, initialProgress, initialDevHold, initialStatus = 'unpaid') {
+  if (isMock) {
+    const idx = mockCoins.findIndex(c => c.address === address);
+    if (idx === -1) {
+      mockCoins.push({
+        address,
+        ticker,
+        name,
+        initial_market_cap: initialMarketCap,
+        initial_progress: initialProgress,
+        initial_dev_hold: initialDevHold,
+        status: initialStatus,
+        created_at: new Date(),
+        paid_at: initialStatus === 'pre_paid' ? new Date() : null
+      });
+      return true;
+    }
+    return false;
+  }
+
   const p = getPool();
   try {
-    // INSERT IGNORE ou INSERT ... ON DUPLICATE KEY UPDATE sem alteração
     const [result] = await p.query(
       `INSERT INTO coins (address, ticker, name, initial_market_cap, initial_progress, initial_dev_hold, status, paid_at) 
        VALUES (?, ?, ?, ?, ?, ?, ?, ?) 
@@ -126,7 +168,7 @@ async function upsertCoin(address, ticker, name, initialMarketCap, initialProgre
         initialStatus === 'pre_paid' ? new Date() : null
       ]
     );
-    return result.affectedRows > 0; // Retorna true se inseriu uma nova moeda
+    return result.affectedRows > 0;
   } catch (err) {
     console.error(`⚠️ Database: Erro ao dar upsert no coin ${ticker}:`, err.message);
     return false;
@@ -134,9 +176,19 @@ async function upsertCoin(address, ticker, name, initialMarketCap, initialProgre
 }
 
 /**
- * Marca uma moeda como "DEX Paid" com o timestamp exato do pagamento.
+ * Marca uma moeda como "DEX Paid".
  */
 async function markCoinAsPaid(address) {
+  if (isMock) {
+    const coin = mockCoins.find(c => c.address === address);
+    if (coin && coin.status === 'unpaid') {
+      coin.status = 'paid';
+      coin.paid_at = new Date();
+      return true;
+    }
+    return false;
+  }
+
   const p = getPool();
   try {
     const now = new Date();
@@ -152,9 +204,20 @@ async function markCoinAsPaid(address) {
 }
 
 /**
- * Insere um ponto de histórico de alta frequência para a Triagem 2.
+ * Insere um ponto de histórico de alta frequência.
  */
 async function insertHistoryPoint(coinAddress, marketCap, progress, devHold) {
+  if (isMock) {
+    mockHistory.push({
+      coin_address: coinAddress,
+      market_cap: marketCap,
+      progress: progress,
+      dev_hold: devHold,
+      timestamp: new Date()
+    });
+    return;
+  }
+
   const p = getPool();
   try {
     await p.query(
@@ -171,11 +234,16 @@ async function insertHistoryPoint(coinAddress, marketCap, progress, devHold) {
  * Obtém todas as moedas na Triagem 2 (DEX Paid nas últimas 15 minutos)
  */
 async function getActiveCoins() {
+  if (isMock) {
+    const fifteenMinutesAgo = Date.now() - 15 * 60 * 1000;
+    return mockCoins.filter(c => c.status === 'paid' && new Date(c.paid_at).getTime() >= fifteenMinutesAgo);
+  }
+
   const p = getPool();
   try {
     const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
     const [rows] = await p.query(
-      `SELECT * FROM coins WHERE status = 'paid' AND paid_at >= ? ORDER BY paid_at DESC`,
+      `SELECT * const from coins WHERE status = 'paid' AND paid_at >= ? ORDER BY paid_at DESC`,
       [fifteenMinutesAgo]
     );
     return rows;
@@ -189,6 +257,11 @@ async function getActiveCoins() {
  * Obtém todas as moedas arquivadas na Triagem 3 (DEX Paid há mais de 15 minutos)
  */
 async function getHistoricalCoins() {
+  if (isMock) {
+    const fifteenMinutesAgo = Date.now() - 15 * 60 * 1000;
+    return mockCoins.filter(c => c.status === 'paid' && new Date(c.paid_at).getTime() < fifteenMinutesAgo);
+  }
+
   const p = getPool();
   try {
     const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
@@ -207,6 +280,17 @@ async function getHistoricalCoins() {
  * Busca todo o histórico de alta frequência de uma moeda.
  */
 async function getHistoryForCoin(coinAddress) {
+  if (isMock) {
+    return mockHistory
+      .filter(h => h.coin_address === coinAddress)
+      .map(h => ({
+        market_cap: h.market_cap,
+        progress: h.progress,
+        dev_hold: h.dev_hold,
+        timestamp: h.timestamp
+      }));
+  }
+
   const p = getPool();
   try {
     const [rows] = await p.query(
@@ -221,12 +305,37 @@ async function getHistoryForCoin(coinAddress) {
 }
 
 /**
- * Exporta todos os dados históricos acumulados (Triagem 3 + Triagem 2 arquivadas) como JSON estruturado.
+ * Exporta todos os dados históricos acumulados como JSON estruturado.
  */
 async function exportToJSON() {
+  if (isMock) {
+    const result = [];
+    const paidCoins = mockCoins.filter(c => c.status === 'paid');
+    for (const coin of paidCoins) {
+      const history = mockHistory.filter(h => h.coin_address === coin.address);
+      result.push({
+        address: coin.address,
+        ticker: coin.ticker,
+        name: coin.name,
+        initialMarketCap: coin.initial_market_cap,
+        initialProgress: coin.initial_progress,
+        initialDevHold: coin.initial_dev_hold,
+        paidAt: coin.paid_at,
+        historyPointsCount: history.length,
+        history: history.map(h => ({
+          marketCap: h.market_cap,
+          progress: h.progress,
+          devHold: h.dev_hold,
+          timestamp: h.timestamp,
+          elapsedSeconds: Math.round((new Date(h.timestamp) - new Date(coin.paid_at)) / 1000)
+        }))
+      });
+    }
+    return result;
+  }
+
   const p = getPool();
   try {
-    // Puxamos todas as moedas que foram pagas (ignorando pré-pagos do boot inicial para manter a pureza estatística da análise)
     const [coins] = await p.query(
       `SELECT * FROM coins WHERE status = 'paid' ORDER BY paid_at ASC`
     );
@@ -263,12 +372,41 @@ async function exportToJSON() {
 }
 
 /**
- * Exporta todos os dados em formato CSV plano (denormalizado) para facilitar análise direta no Excel ou Sheets.
+ * Exporta todos os dados em formato CSV plano.
  */
 async function exportToCSV() {
+  if (isMock) {
+    const paidCoins = mockCoins.filter(c => c.status === 'paid');
+    let csvContent = "Coin Address,Ticker,Name,Initial Market Cap,Initial Bonding Curve,Initial Dev Hold,Paid At,Snapshot Time,Elapsed Seconds,Snapshot Market Cap,Snapshot Bonding Curve,Snapshot Dev Hold\n";
+
+    for (const coin of paidCoins) {
+      const history = mockHistory.filter(h => h.coin_address === coin.address);
+      const cleanAddress = coin.address.replace(/"/g, '""');
+      const cleanTicker = coin.ticker.replace(/"/g, '""');
+      const cleanName = coin.name ? coin.name.replace(/"/g, '""') : '';
+      const cleanMCap = coin.initial_market_cap.replace(/"/g, '""');
+      const cleanProg = coin.initial_progress.replace(/"/g, '""');
+      const cleanDev = coin.initial_dev_hold.replace(/"/g, '""');
+      const paidAtStr = coin.paid_at ? new Date(coin.paid_at).toISOString() : '';
+
+      if (history.length === 0) {
+        csvContent += `"${cleanAddress}","${cleanTicker}","${cleanName}","${cleanMCap}","${cleanProg}","${cleanDev}","${paidAtStr}",N/A,N/A,"${cleanMCap}","${cleanProg}","${cleanDev}"\n`;
+      } else {
+        for (const snap of history) {
+          const snapTimeStr = new Date(snap.timestamp).toISOString();
+          const elapsedSecs = Math.round((new Date(snap.timestamp) - new Date(coin.paid_at)) / 1000);
+          const snapMCap = snap.market_cap.replace(/"/g, '""');
+          const snapProg = snap.progress.replace(/"/g, '""');
+          const snapDev = snap.dev_hold.replace(/"/g, '""');
+          csvContent += `"${cleanAddress}","${cleanTicker}","${cleanName}","${cleanMCap}","${cleanProg}","${cleanDev}","${paidAtStr}","${snapTimeStr}",${elapsedSecs},"${snapMCap}","${snapProg}","${snapDev}"\n`;
+        }
+      }
+    }
+    return csvContent;
+  }
+
   const p = getPool();
   try {
-    // Coleta as moedas monitoradas que pagaram a DEX
     const [coins] = await p.query(
       `SELECT * FROM coins WHERE status = 'paid' ORDER BY paid_at ASC`
     );
@@ -290,7 +428,6 @@ async function exportToCSV() {
       const paidAtStr = coin.paid_at ? new Date(coin.paid_at).toISOString() : '';
 
       if (history.length === 0) {
-        // Se por algum motivo não tiver snapshots salvos, grava ao menos a linha inicial
         csvContent += `"${cleanAddress}","${cleanTicker}","${cleanName}","${cleanMCap}","${cleanProg}","${cleanDev}","${paidAtStr}",N/A,N/A,"${cleanMCap}","${cleanProg}","${cleanDev}"\n`;
       } else {
         for (const snap of history) {
