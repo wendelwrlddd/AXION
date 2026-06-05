@@ -75,40 +75,27 @@ async function getDevHold(traderPublicKey, mintAddress) {
 }
 
 /**
- * Consulta a API de ordens da DexScreener para verificar se o token pagou o perfil avançado.
+ * Consulta a API de Tokens da DexScreener em LOTE (Batching) para verificar se pagaram o perfil.
+ * O endpoint 'latest/dex/tokens' permite até 30 endereços separados por vírgula em uma única requisição.
  */
-async function checkDexPaid(mintAddress) {
-  if (!mintAddress) return false;
-  const cleanMint = mintAddress.replace("solana:", "");
+async function checkDexPaidBatch(coinsBatch) {
+  if (!coinsBatch || coinsBatch.length === 0) return [];
   
-  // 1. PRIMEIRA CHECAGEM: API de Pedidos (Orders API)
-  let paidViaOrders = false;
-  const ordersUrl = `https://api.dexscreener.com/orders/v1/solana/${cleanMint}`;
-  try {
-    const res = await fetch(ordersUrl);
-    if (res.ok) {
-      const json = await res.json();
-      if (json.orders && Array.isArray(json.orders)) {
-        paidViaOrders = json.orders.some(o => o.type === "tokenProfile" && o.status === "approved");
-      }
-    }
-  } catch (err) {
-    logMonitor(`Erro ao checar DEX Paid via Orders para ${cleanMint}: ${err.message}`, "WARN");
-  }
+  const paidCoins = [];
+  const cleanMints = coinsBatch.map(c => c.address.replace("solana:", ""));
+  const mintString = cleanMints.join(',');
 
-  if (paidViaOrders) {
-    logMonitor(`🚨 DEX Paid detectado via Orders API para ${cleanMint}`, "INFO");
-    return true;
-  }
-
-  // 2. SEGUNDA CHECAGEM: API de Tokens (Token Pairs API) - Checando ícones/links/banners
-  const tokenUrl = `https://api.dexscreener.com/latest/dex/tokens/${cleanMint}`;
+  const tokenUrl = `https://api.dexscreener.com/latest/dex/tokens/${mintString}`;
   try {
     const res = await fetch(tokenUrl);
     if (res.ok) {
       const json = await res.json();
       if (json.pairs && Array.isArray(json.pairs)) {
         for (const pair of json.pairs) {
+          const cleanPairMintBase = pair.baseToken?.address;
+          const cleanPairMintQuote = pair.quoteToken?.address;
+          if (!cleanPairMintBase && !cleanPairMintQuote) continue;
+
           // Se o desenvolvedor pagou, o DexScreener anexa um objeto "info" com os metadados ricos
           if (pair.info) {
             const hasIcon = !!pair.info.imageUrl || !!pair.info.icon;
@@ -118,18 +105,85 @@ async function checkDexPaid(mintAddress) {
 
             // Se tiver qualquer informação de perfil rica adicionada, é DEX Paid!
             if (hasIcon || hasWebsites || hasSocials || hasHeader) {
-              logMonitor(`🚨 DEX Paid detectado via Token Info (Ícone/Banner/Links ativos) para ${cleanMint}`, "INFO");
-              return true;
+              const matchingCoin = coinsBatch.find(c => 
+                (cleanPairMintBase && c.address.includes(cleanPairMintBase)) || 
+                (cleanPairMintQuote && c.address.includes(cleanPairMintQuote))
+              );
+              if (matchingCoin && !paidCoins.some(pc => pc.address === matchingCoin.address)) {
+                paidCoins.push(matchingCoin);
+                logMonitor(`🚨 DEX Paid detectado via Token Info (Em Lote) para ${matchingCoin.ticker}`, "INFO");
+              }
             }
           }
         }
       }
+    } else if (res.status === 429) {
+      logMonitor(`Rate limit da DexScreener atingido no batch. Retentando no próximo ciclo.`, "WARN");
     }
   } catch (err) {
-    logMonitor(`Erro ao checar DEX Paid via Token Info para ${cleanMint}: ${err.message}`, "WARN");
+    logMonitor(`Erro ao checar DEX Paid em lote: ${err.message}`, "WARN");
   }
 
+  return paidCoins;
+}
+
+/**
+ * Consulta a API de ordens da DexScreener para verificação SUPER RÁPIDA (Instantânea)
+ */
+async function checkDexPaidOrders(mintAddress) {
+  if (!mintAddress) return false;
+  const cleanMint = mintAddress.replace("solana:", "");
+  const ordersUrl = `https://api.dexscreener.com/orders/v1/solana/${cleanMint}`;
+  try {
+    const res = await fetch(ordersUrl);
+    if (res.ok) {
+      const json = await res.json();
+      if (json.orders && Array.isArray(json.orders)) {
+        if (json.orders.some(o => o.type === "tokenProfile" && o.status === "approved")) {
+          logMonitor(`⚡ DEX Paid detectado INSTANTANEAMENTE via Orders API para ${cleanMint}`, "INFO");
+          return true;
+        }
+      }
+    }
+  } catch (err) {
+    // Falha silenciosa para não poluir os logs em rate limits
+  }
   return false;
+}
+
+/**
+ * Função exportada para processar moedas que pagaram a DEX.
+ * Pode ser chamada via Webhook (pelo Checker worker).
+ */
+async function processPaidTransition(coin, source) {
+  const success = await db.markCoinAsPaid(coin.address);
+  if (success) {
+    logMonitor(`🚨🚨🚨 [TRIAGEM 2 - DEX PAID] A moeda ${coin.ticker} PAGOU A DEX AGORA! (via ${source})`, "ALERT");
+    const paidAt = new Date();
+    const metrics = await getDexTokenMetrics(coin.address);
+    const currentMCap = metrics ? metrics.marketCap : coin.initial_market_cap;
+    const devWallet = coinCreators.get(coin.address);
+    const devHold = await getDevHold(devWallet, coin.address);
+
+    activeTriagem2.set(coin.address, {
+      ticker: coin.ticker, name: coin.name, marketCap: currentMCap,
+      progress: metrics && metrics.dexId === 'raydium' ? "100%" : "0%",
+      devHold: devHold, paidAt: paidAt, lastHistoryTime: Date.now()
+    });
+
+    await db.insertHistoryPoint(coin.address, currentMCap, metrics && metrics.dexId === 'raydium' ? "100%" : "0%", devHold);
+
+    if (sseBroadcastFn) {
+      sseBroadcastFn({
+        event: "transition",
+        data: {
+          address: coin.address, ticker: coin.ticker, name: coin.name,
+          initialMarketCap: currentMCap, initialProgress: metrics && metrics.dexId === 'raydium' ? "100%" : "0%",
+          initialDevHold: devHold, paidAt: paidAt.getTime()
+        }
+      });
+    }
+  }
 }
 
 /**
@@ -321,80 +375,52 @@ async function initMonitor() {
   // 1. Inicia conexão WebSocket para Triagem 1
   connectWebSocket();
 
-  // 2. Loop staggered para checar transições "DEX Paid" via API DexScreener de forma segura (Max 30 req/min)
-  logMonitor("Iniciando Verificador Staggered de Transições DEX Paid...");
+  // 2. Worker de checagem DexScreener (Triagem 1 -> Triagem 2)
   staggeredCheckerInterval = setInterval(async () => {
+    // Recarrega a fila se estiver vazia
     if (checkQueue.length === 0) {
       try {
         const pool = db.getPool();
-        const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+        const thirtyMinsAgo = new Date(Date.now() - 30 * 60 * 1000);
+        
         const [rows] = await pool.query(
           "SELECT address, ticker, name, initial_market_cap, initial_progress, initial_dev_hold FROM coins WHERE status = 'unpaid' AND created_at >= ? ORDER BY created_at DESC",
-          [twoHoursAgo]
+          [thirtyMinsAgo]
         );
         checkQueue = rows;
         checkQueueIndex = 0;
       } catch (err) {
-        logMonitor(`Erro ao alimentar fila de checagem DEX Paid: ${err.message}`, "WARN");
+        logMonitor(`Erro ao buscar moedas para checagem: ${err.message}`, "ERROR");
       }
     }
 
+    // Processa um lote da fila
     if (checkQueue.length > 0) {
-      const coin = checkQueue[checkQueueIndex];
-      checkQueueIndex = (checkQueueIndex + 1) % checkQueue.length;
+      // 4 requisições por segundo para respeitar o limite de 300 req/minuto
+      const batchSize = 4;
+      const currentBatch = checkQueue.slice(checkQueueIndex, checkQueueIndex + batchSize);
+      checkQueueIndex += batchSize;
 
-      if (checkQueueIndex === 0) {
-        checkQueue = []; // Limpa fila para nova consulta
+      // Se passou do fim da fila, limpa para forçar recarregamento do banco
+      if (checkQueueIndex >= checkQueue.length) {
+        checkQueue = [];
       }
 
-      if (coin) {
-        const isPaid = await checkDexPaid(coin.address);
-        if (isPaid) {
-          // 🚨 TRANSITOU! DEX PAGA AGORA!
-          const success = await db.markCoinAsPaid(coin.address);
-          if (success) {
-            logMonitor(`🚨🚨🚨 [TRIAGEM 2 - DEX PAID] A moeda ${coin.ticker} PAGOU A DEX AGORA!`, "ALERT");
-
-            const paidAt = new Date();
-            const metrics = await getDexTokenMetrics(coin.address);
-            const currentMCap = metrics ? metrics.marketCap : coin.initial_market_cap;
-
-            const devWallet = coinCreators.get(coin.address);
-            const devHold = await getDevHold(devWallet, coin.address);
-
-            activeTriagem2.set(coin.address, {
-              ticker: coin.ticker,
-              name: coin.name,
-              marketCap: currentMCap,
-              progress: metrics && metrics.dexId === 'raydium' ? "100%" : "0%",
-              devHold: devHold,
-              paidAt: paidAt,
-              lastHistoryTime: Date.now()
-            });
-
-            await db.insertHistoryPoint(coin.address, currentMCap, metrics && metrics.dexId === 'raydium' ? "100%" : "0%", devHold);
-
-            if (sseBroadcastFn) {
-              sseBroadcastFn({
-                event: "transition",
-                data: {
-                  address: coin.address,
-                  ticker: coin.ticker,
-                  name: coin.name,
-                  initialMarketCap: currentMCap,
-                  initialProgress: metrics && metrics.dexId === 'raydium' ? "100%" : "0%",
-                  initialDevHold: devHold,
-                  paidAt: paidAt.getTime()
-                }
-              });
-            }
+      if (currentBatch.length > 0) {
+        const checks = currentBatch.map(coin => checkDexPaidOrders(coin.address).then(isPaid => {
+          if (isPaid) {
+            logMonitor(`DEX Paid detectado para ${coin.ticker}! Processando transição internamente...`, "ALERT");
+            // Remove a moeda da fila local para não checar duas vezes antes de recarregar
+            checkQueue = checkQueue.filter(c => c.address !== coin.address);
+            
+            // Avisa o monitor interno (que vai atualizar o banco e a memória)
+            return processPaidTransition(coin, "Internal Checker Worker");
           }
-        }
+        }));
+        await Promise.all(checks);
       }
     }
-  }, 2000); // Executa checagem de 1 moeda a cada 2 segundos
-
-  // 3. Worker de alta frequência para Triagem 2 (30s)
+  }, 1000);
   await startActiveStage2Worker();
 
   // 4. Limpeza automática do MySQL: Deleta moedas Unpaid com mais de 2 horas a cada 5 minutos
@@ -422,7 +448,6 @@ async function stopMonitor() {
   logMonitor("Finalizando monitoramento...");
   if (reconnectTimeout) clearTimeout(reconnectTimeout);
   if (ws) ws.close();
-  if (staggeredCheckerInterval) clearInterval(staggeredCheckerInterval);
   if (activeStage2Tracker) clearInterval(activeStage2Tracker);
   if (cleanupInterval) clearInterval(cleanupInterval);
   logMonitor("WebSocket fechado, loops parados e monitor finalizado.");
@@ -432,5 +457,6 @@ module.exports = {
   initMonitor,
   stopMonitor,
   setSSEBroadcast,
+  processPaidTransition,
   activeTriagem2
 };

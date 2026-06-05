@@ -44,6 +44,26 @@ monitor.setSSEBroadcast((payload) => {
   }
 });
 
+// Endpoint seguro via rede interna para o Checker Worker relatar moedas pagas
+app.post('/webhook/dex-paid', async (req, res) => {
+  try {
+    const { coin, source } = req.body;
+    if (!coin || !coin.address) {
+      return res.status(400).json({ error: "Missing coin data" });
+    }
+    
+    console.log(`[WEBHOOK] Recebido alerta de DEX Paid para ${coin.ticker} (via ${source})`);
+    
+    // Processa a transição, salva no banco e emite SSE para o Frontend
+    await monitor.processPaidTransition(coin, source || "Checker API");
+    
+    res.status(200).json({ success: true, message: "Webhook processado com sucesso" });
+  } catch (err) {
+    console.error("❌ Erro ao processar webhook:", err.message);
+    res.status(500).json({ error: "Erro interno no webhook" });
+  }
+});
+
 /**
  * API: Obter todas as moedas na Triagem 2 (ativas nos 15 minutos pós-DEX paid)
  * Retorna também o histórico temporal de cada uma para remontar os gráficos no front-end ao atualizar a tela.

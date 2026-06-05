@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "start:checker": "node checker.js",
     "simulate": "node simulate.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
