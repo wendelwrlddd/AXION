@@ -1,5 +1,6 @@
 const WebSocket = require('ws');
 const db = require('./database');
+const interceptor = require('./blockchain_interceptor');
 require('dotenv').config();
 
 // Armazena as moedas ativas em memória na Triagem 2 com seus cronômetros
@@ -375,7 +376,11 @@ async function initMonitor() {
   // 1. Inicia conexão WebSocket para Triagem 1
   connectWebSocket();
 
-  // 2. Worker de checagem DexScreener (Triagem 1 -> Triagem 2)
+  // 1.5 Inicia Interceptador da Blockchain (Sniper Mode)
+  interceptor.setProcessTransition(processPaidTransition);
+  interceptor.startInterceptor(coinCreators, () => checkQueue);
+
+  // 2. Worker de checagem DexScreener (Triagem 1 -> Triagem 2) - Fallback a cada 10s
   staggeredCheckerInterval = setInterval(async () => {
     // Recarrega a fila se estiver vazia
     if (checkQueue.length === 0) {
@@ -409,18 +414,15 @@ async function initMonitor() {
       if (currentBatch.length > 0) {
         const checks = currentBatch.map(coin => checkDexPaidOrders(coin.address).then(isPaid => {
           if (isPaid) {
-            logMonitor(`DEX Paid detectado para ${coin.ticker}! Processando transição internamente...`, "ALERT");
-            // Remove a moeda da fila local para não checar duas vezes antes de recarregar
+            logMonitor(`DEX Paid detectado via API de Fallback para ${coin.ticker}!`, "ALERT");
             checkQueue = checkQueue.filter(c => c.address !== coin.address);
-            
-            // Avisa o monitor interno (que vai atualizar o banco e a memória)
-            return processPaidTransition(coin, "Internal Checker Worker");
+            return processPaidTransition(coin, "API Fallback Checker");
           }
         }));
         await Promise.all(checks);
       }
     }
-  }, 1000);
+  }, 10000); // Mudado para 10s como fallback, o interceptor é a via principal
   await startActiveStage2Worker();
 
   // 4. Limpeza automática do MySQL: Deleta moedas Unpaid com mais de 2 horas a cada 5 minutos
